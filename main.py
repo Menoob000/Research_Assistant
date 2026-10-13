@@ -1,9 +1,9 @@
-from agent import app
+from agent.agent import app
 from langchain_core.messages import HumanMessage
 
 def main():
     message = {'messages' : HumanMessage(content="What's the capital of France")}
-    response = app.invoke(message)
+    response = app.invoke(message, config={'configurable' : {"thread_id" : 1}})
     print(response['messages'][-1].content)
 
 

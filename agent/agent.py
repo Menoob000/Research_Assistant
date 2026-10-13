@@ -1,5 +1,5 @@
 import os
-from typing import Annotated, List, TypedDict
+from typing import Annotated, List, TypedDict, Literal
 
 from dotenv import load_dotenv
 
@@ -10,10 +10,12 @@ from langchain_openrouter import ChatOpenRouter
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
-
+from pydantic import Field, BaseModel
 from config import MODEL_NAME
 from rag.vector_store import VectorStore
 from tools.search import search_tool
+from langgraph.checkpoint.sqlite import SqliteSaver
+import sqlite3
 
 llm = ChatOpenRouter(model=MODEL_NAME)
 
@@ -23,6 +25,16 @@ llm_with_tools = llm.bind_tools(tools)
 
 _vector_store = None
 
+conn = sqlite3.connect("prototype.db", check_same_thread=False)
+checkpoint = SqliteSaver(conn)
+
+
+def get_all_threads():
+    all_threads = set()
+    for ckpt in checkpoint.list(None):
+        all_threads.add(ckpt.config['configurable']['thread_id'])
+
+    return list(all_threads)
 
 def get_vector_store() -> VectorStore:
     global _vector_store
@@ -39,7 +51,46 @@ class AgentState(TypedDict):
     iterations: int
     context: str
     reflection_log: List[str]
+    route : str
 
+class RouteDecision(BaseModel):
+    decision : Literal["retrieve", "general"] = Field(
+        description="Use retrieve for questions that may need RAG; general for simple conversations like greetings and simple questions"
+    )
+
+router_llm = llm.with_structured_output(RouteDecision, method="json_mode")
+def route_decision(state: AgentState):
+    """A node to route to a general agent, or a rag based agent"""
+
+    prompt = f"""
+    You are a router agent that's going to evaluate whether the user's question is a general and simple question, that can be answered without retrieving using RAG
+
+    Route to 'general' if : 
+    The user asked a simple question like : 
+        - Hi, who are you
+        - What's the capital of France
+
+    Route to 'retrieve' if the user asked a question that may need a particular document to solve like : 
+        - Who are the authors of this research paper
+        - How many contributors are there in this research paper
+        - What's the methodology of this research paper
+    
+    The user's question : 
+    {state['messages'][-1].content}
+Return your response as valid JSON.
+Example:
+{{"route": "general"}}
+"""
+    response = router_llm.invoke(prompt)
+    print("[Router]", response.decision)
+    return {
+        'route' : response.decision
+    }
+
+def route_after_router(state: AgentState):
+    if state["route"] == "general":
+        return "general"
+    return "retrieve"
 
 def extract_text(response) -> str:
     """
@@ -169,25 +220,6 @@ REFINED_QUERY: <a better, more specific search query to find the missing informa
     }
 
 
-# def generate(state: AgentState) -> dict:
-#     """Generate the final answer grounded strictly in the validated context."""
-#     question = state.get("query") or (
-#         state["messages"][-1].content if state.get("messages") else ""
-#     )
-#     prompt = f"""You are a precise, helpful assistant. Answer the question using ONLY the provided context.
-# If the context is insufficient for a complete answer, clearly state what is missing — do not hallucinate.
-
-# Question: {question}
-
-# Validated Context:
-# {state.get('context', '')}
-
-# Write a clear, structured answer grounded in the context above."""
-
-#     response = llm.invoke(prompt)
-#     return {"messages": [response]}
-
-
 def route_to_general(state: AgentState):
     """
     Route to 'general' assistant if there are no retrieved documents,
@@ -246,11 +278,16 @@ tool_node = ToolNode(tools)
 workflow.add_node("retrieve", retriever)
 workflow.add_node("grade_retrieval", grade_retrieval)
 workflow.add_node("rewrite_query", rewrite_query)
+workflow.add_node('initial_decision', route_decision)
 
 workflow.add_node("general", general_assistant)
 workflow.add_node("tools", tool_node)
 
-workflow.set_entry_point("retrieve")
+workflow.set_entry_point("initial_decision")
+workflow.add_conditional_edges("initial_decision", route_after_router, {
+    "general" : "general",
+    "retrieve" : "retrieve"
+})
 workflow.add_edge("retrieve", "grade_retrieval")
 
 workflow.add_conditional_edges(
@@ -267,7 +304,7 @@ workflow.add_edge("tools", "general")
 workflow.add_edge("rewrite_query", "retrieve")
 
 
-app = workflow.compile()
+app = workflow.compile(checkpointer=checkpoint)
 
 try:
     graph = app.get_graph().draw_mermaid_png()
